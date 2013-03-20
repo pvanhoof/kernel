@@ -66,6 +66,7 @@ struct qmidev {
 	struct list_head clients;
 	spinlock_t clients_lock;
 	atomic_t qmitid;
+	atomic_t valid;
 };
 
 enum {

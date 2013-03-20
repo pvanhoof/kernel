@@ -100,7 +100,7 @@ static long devqmi_compat_ioctl(struct file *file, unsigned int cmd,
 				unsigned long arg);
 #endif
 static int devqmi_release(struct inode *inode, struct file *file);
-static void devqmi_cleanup(struct file *file);
+static void devqmi_cleanup(struct inode *inode, struct file *file);
 static ssize_t devqmi_read(struct file *file, char __user *buf, size_t size,
 			   loff_t *pos);
 static ssize_t devqmi_write(struct file *file, const char __user *buf,
@@ -1276,7 +1276,12 @@ static long devqmi_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EBADR;
 		}
 
-		devqmi_cleanup(file);
+		if (file != NULL && file->f_path.dentry != NULL) {
+			devqmi_cleanup(file->f_path.dentry->d_inode, file);
+		} else {
+			GOBI_ERROR("IOCTL_QMI_CLOSE: file or f_path.dentry NULL: %s", file == NULL ? "file" : "f_path.dentry");
+			return -ENOMEM;
+		}
 		return 0;
 
 	case IOCTL_QMI_GET_DEVICE_VIDPID:
@@ -1339,9 +1344,15 @@ static long devqmi_compat_ioctl(struct file *file, unsigned int cmd,
 }
 #endif
 
-static void devqmi_cleanup(struct file *file)
+static void devqmi_cleanup(struct inode *inode, struct file *file)
 {
 	struct qmihandle *handle = (struct qmihandle *)file->private_data;
+	struct qmidev *qmidev = container_of(inode->i_cdev, struct qmidev, cdev);
+
+	if (atomic_sub_return (0, &qmidev->valid) == 0) {
+		GOBI_WARN("devqmi cleanup while USB disconnected");
+		return;
+	}
 
 	if (handle) {
 		file->private_data = NULL;
@@ -1355,7 +1366,7 @@ static void devqmi_cleanup(struct file *file)
 
 static int devqmi_release(struct inode *inode, struct file *file)
 {
-	devqmi_cleanup(file);
+	devqmi_cleanup(inode, file);
 	return 0;
 }
 
@@ -1593,6 +1604,8 @@ int qc_register(struct qcusbnet *dev)
 	printk(KERN_INFO "gobi: registered qcqmi%d", qmiidx);
 
 	dev->qmi.devnum = devno;
+	atomic_set(&dev->qmi.valid, 1);
+
 	return 0;
 
 fail_cdev_del:
@@ -1614,6 +1627,8 @@ void qc_deregister(struct qcusbnet *dev)
 	int sync_flags = SYNC_TIMEOUT;
 	unsigned long flags;
 	u16 cid;
+
+	atomic_set(&dev->qmi.valid, 0);
 
 	spin_lock_irqsave(&dev->qmi.clients_lock, flags);
 	while (!list_empty(&dev->qmi.clients)) {
