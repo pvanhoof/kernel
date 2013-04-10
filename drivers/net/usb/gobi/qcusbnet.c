@@ -28,6 +28,8 @@
 #define DRIVER_AUTHOR "Qualcomm Innovation Center"
 #define DRIVER_DESC "gobi"
 
+#define TX_QLEN(dev) (((dev)->udev->speed == USB_SPEED_HIGH) ? ((dev)->usbnet->net->tx_queue_len) : 4)
+
 static LIST_HEAD(qcusbnet_list);
 static DEFINE_MUTEX(qcusbnet_lock);
 
@@ -50,6 +52,28 @@ static struct kobj_type ktype_qcusbnet = {
 void qcusbnet_put(struct qcusbnet *dev)
 {
 	kobject_put(&dev->kobj);
+}
+
+static void
+qcusbnet_decurbcnt (struct qcusbnet *dev)
+{
+	if (--dev->urbcnt < TX_QLEN (dev)) {
+		GOBI_VERBOSE ("qcusbnet_decurbcnt %d (qlen=%lu, mtu=%u)", dev->urbcnt, TX_QLEN(dev), dev->hard_mtu);
+		if (atomic_sub_return (1, &dev->stopped) == 0) {
+			GOBI_VERBOSE ("qcusbnet_decurbcnt woke");
+			netif_wake_queue (dev->usbnet->net);
+		}
+	}
+}
+
+static void
+qcusbnet_incurbcnt (struct qcusbnet *dev)
+{
+	if (++dev->urbcnt > TX_QLEN (dev)) {
+		GOBI_VERBOSE ("qcusbnet_incurbcnt %d sleep (qlen=%lu, mtu=%u)", dev->urbcnt, TX_QLEN(dev), dev->hard_mtu);
+		netif_stop_queue (dev->usbnet->net);
+		atomic_set (&dev->stopped, 1);
+	}
 }
 
 struct qcusbnet *qcusbnet_get(struct qcusbnet *key)
@@ -257,6 +281,9 @@ static void qcnet_bg_complete(struct work_struct *work)
 	usb_autopm_put_interface(dev->iface);
 
 	spin_lock_irqsave(&dev->urbs_lock, listflags);
+
+	qcusbnet_decurbcnt (dev);
+
 	if (!list_empty(&dev->urbs))
 		queue_work(dev->workqueue, &dev->startxmit);
 	spin_unlock_irqrestore(&dev->urbs_lock, listflags);
@@ -266,21 +293,28 @@ static void qcnet_complete(struct urb *urb)
 {
 	struct qcusbnet *dev = urb->context;
 
+	BUG_ON(urb != dev->active);
+
 	queue_work(dev->workqueue, &dev->complete);
 }
 
 static void qcnet_bg_txtimeout(struct work_struct *work)
 {
+	unsigned long listflags;
 	struct qcusbnet *dev = container_of(work, struct qcusbnet, txtimeout);
 	struct list_head *node, *tmp;
 	struct urb *urb;
 	if (dev->active)
 		usb_kill_urb(dev->active);
+
+	spin_lock_irqsave(&dev->urbs_lock, listflags);
 	list_for_each_safe(node, tmp, &dev->urbs) {
 		urb = list_entry(node, struct urb, urb_list);
 		list_del(&urb->urb_list);
 		usb_free_urb(urb);
+		qcusbnet_decurbcnt (dev);
 	}
+	spin_unlock_irqrestore(&dev->urbs_lock, listflags);
 }
 
 static void qcnet_txtimeout(struct net_device *netdev)
@@ -288,6 +322,31 @@ static void qcnet_txtimeout(struct net_device *netdev)
 	struct usbnet *usbnet = netdev_priv(netdev);
 	struct qcusbnet *dev = (struct qcusbnet *)usbnet->data[0];
 	queue_work(dev->workqueue, &dev->txtimeout);
+}
+
+static int qcnet_change_mtu (struct net_device *netdev, int new_mtu)
+{
+	struct usbnet *usbnet = netdev_priv(netdev);
+	struct qcusbnet *dev = (struct qcusbnet *)usbnet->data[0];
+	int ll_mtu = new_mtu + usbnet->net->hard_header_len;
+	int old_hard_mtu = dev->hard_mtu;
+	int old_rx_urb_size = dev->rx_urb_size;
+
+	if (new_mtu <= 0)
+		return -EINVAL;
+	/* no second zero-length packet read wanted after mtu-sized packets */
+	if ((ll_mtu % dev->maxpacket) == 0)
+		return -EDOM;
+	usbnet->net->mtu = new_mtu;
+
+	dev->hard_mtu = usbnet->net->mtu + usbnet->net->hard_header_len;
+	if (dev->rx_urb_size == old_hard_mtu) {
+		dev->rx_urb_size = dev->hard_mtu;
+		if (dev->rx_urb_size > old_rx_urb_size)
+			usbnet_unlink_rx_urbs(usbnet);
+	}
+
+	return 0;
 }
 
 static void qcnet_bg_startxmit(struct work_struct *work)
@@ -336,10 +395,11 @@ static void qcnet_bg_startxmit(struct work_struct *work)
 	}
 
 	dev->active = urb;
+
 	status = usb_submit_urb(urb, GFP_KERNEL);
 	if (status < 0) {
 		GOBI_ERROR("failed to submit urb: %d (packet dropped)", status);
-		usb_free_urb(dev->active);
+		usb_free_urb(urb);
 		dev->active = NULL;
 		usb_autopm_put_interface(dev->iface);
 	}
@@ -379,6 +439,7 @@ static int qcnet_startxmit(struct sk_buff *skb, struct net_device *netdev)
 
 	spin_lock_irqsave(&dev->urbs_lock, listflags);
 	list_add_tail(&urb->urb_list, &dev->urbs);
+	qcusbnet_incurbcnt (dev);
 	spin_unlock_irqrestore(&dev->urbs_lock, listflags);
 
 	queue_work(dev->workqueue, &dev->startxmit);
@@ -582,6 +643,7 @@ static int discover_endpoints(struct qcusbnet *dev)
 
 int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids)
 {
+	struct usb_device *xdev;
 	int status;
 	struct usbnet *usbnet;
 	struct qcusbnet *dev;
@@ -590,6 +652,9 @@ int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids
 	int addr_len;
 	u8 *addr;
 	const char *id;
+
+	xdev = interface_to_usbdev (iface);
+	usb_get_dev (xdev);
 
 	status = usbnet_probe(iface, vidpids);
 	if (status < 0) {
@@ -618,6 +683,7 @@ int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids
 		goto fail_disconnect;
 	}
 
+	dev->udev = xdev;
 	dev->dying = false;
 	dev->iface = iface;
 
@@ -646,6 +712,7 @@ int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids
 	netdevops->ndo_stop = qcnet_stop;
 	netdevops->ndo_start_xmit = qcnet_startxmit;
 	netdevops->ndo_tx_timeout = qcnet_txtimeout;
+	netdevops->ndo_change_mtu = qcnet_change_mtu;
 
 	usbnet->net->netdev_ops = netdevops;
 
@@ -667,6 +734,8 @@ int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids
 
 	spin_lock_init(&dev->urbs_lock);
 	INIT_LIST_HEAD(&dev->urbs);
+	atomic_set (&dev->stopped, 0);
+	dev->urbcnt = 0;
 	dev->active = NULL;
 	INIT_WORK(&dev->startxmit, qcnet_bg_startxmit);
 	INIT_WORK(&dev->txtimeout, qcnet_bg_txtimeout);
@@ -677,6 +746,13 @@ int qcnet_probe(struct usb_interface *iface, const struct usb_device_id *vidpids
 	dev->down = 0;
 	qc_setdown(dev, DOWN_NO_NDIS_CONNECTION);
 	qc_setdown(dev, DOWN_NET_IFACE_STOPPED);
+
+	dev->usbnet->net->tx_queue_len = 4;
+	dev->hard_mtu = usbnet->net->mtu + usbnet->net->hard_header_len;
+
+	if (!dev->rx_urb_size)
+		dev->rx_urb_size = dev->hard_mtu;
+	dev->maxpacket = usb_maxpacket (dev->udev, usbnet->out, 1);
 
 	status = qc_register(dev);
 	if (status) {
@@ -719,6 +795,7 @@ EXPORT_SYMBOL_GPL(qcnet_probe);
 
 static void qcnet_disconnect(struct usb_interface *intf)
 {
+	unsigned long listflags;
 	struct usbnet *usbnet = usb_get_intfdata(intf);
 	struct qcusbnet *dev = (struct qcusbnet *)usbnet->data[0];
 	struct list_head *node, *tmp;
@@ -730,11 +807,16 @@ static void qcnet_disconnect(struct usb_interface *intf)
 	qc_deregister(dev);
 
 	destroy_workqueue(dev->workqueue);
+
+	spin_lock_irqsave(&dev->urbs_lock, listflags);
 	list_for_each_safe(node, tmp, &dev->urbs) {
 		urb = list_entry(node, struct urb, urb_list);
 		list_del(&urb->urb_list);
 		usb_free_urb(urb);
+		qcusbnet_decurbcnt (dev);
 	}
+	spin_unlock_irqrestore(&dev->urbs_lock, listflags);
+
 	usbnet_disconnect(intf);
 	qcusbnet_put(dev);
 }

@@ -45,6 +45,12 @@ do { \
 #define GOBI_WARN(fmt, arg...)  GOBI_LOG(1, fmt, ##arg)
 #define GOBI_DEBUG(fmt, arg...) GOBI_LOG(2, fmt, ##arg)
 
+#ifdef VERBOSE_GOBI_DEBUG
+#define GOBI_VERBOSE(fmt, arg...) GOBI_LOG(0, fmt, ##arg)
+#else
+#define GOBI_VERBOSE(fmt, arg...)
+#endif
+
 struct qcusbnet;
 
 struct urbreq {
@@ -84,6 +90,7 @@ struct qcusbnet {
 	struct kobject kobj;
 	struct usbnet *usbnet;
 	struct usb_interface *iface;
+	struct usb_device *udev;
 	int (*open)(struct net_device *);
 	int (*stop)(struct net_device *);
 	unsigned long down;
@@ -97,6 +104,8 @@ struct qcusbnet {
 	spinlock_t urbs_lock;
 	struct list_head urbs;
 	struct urb *active;
+	unsigned int urbcnt;
+	atomic_t stopped;
 
 	struct work_struct startxmit;
 	struct work_struct txtimeout;
@@ -106,6 +115,10 @@ struct qcusbnet {
 	unsigned int int_in_endp;
 	unsigned int bulk_in_endp;
 	unsigned int bulk_out_endp;
+
+	u32 hard_mtu;
+	size_t rx_urb_size;
+	unsigned maxpacket;
 };
 
 #endif /* !QCUSBNET_STRUCTS_H */
